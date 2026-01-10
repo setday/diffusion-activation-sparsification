@@ -10,7 +10,6 @@ torch.backends.cudnn.allow_tf32 = True
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from collections import OrderedDict
-from PIL import Image
 from copy import deepcopy
 from glob import glob
 from time import time
@@ -64,34 +63,12 @@ def create_logger(logging_dir):
     return logger
 
 
-def center_crop_arr(pil_image, image_size):
-    """
-    Center cropping implementation from ADM.
-    https://github.com/openai/guided-diffusion/blob/8fb3ad9197f16bbc40620447b2742e13458d2831/guided_diffusion/image_datasets.py#L126
-    """
-    while min(*pil_image.size) >= 2 * image_size:
-        pil_image = pil_image.resize(
-            tuple(x // 2 for x in pil_image.size), resample=Image.BOX
-        )
-
-    scale = image_size / min(*pil_image.size)
-    pil_image = pil_image.resize(
-        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
-    )
-
-    arr = np.array(pil_image)
-    crop_y = (arr.shape[0] - image_size) // 2
-    crop_x = (arr.shape[1] - image_size) // 2
-    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
-
-
 class CustomDataset(Dataset):
-    def __init__(self, features_dir, labels_dir):
+    def __init__(self, features_dir):
         self.features_dir = features_dir
-        self.labels_dir = labels_dir
 
-        self.features_files = sorted(os.listdir(features_dir))
-        self.labels_files = sorted(os.listdir(labels_dir))
+        self.features_files = np.load(os.path.join(self.features_dir, "imagenet256_features_all.npy"))
+        self.labels_files = np.load(os.path.join(self.features_dir, "imagenet256_labels_all.npy"))
 
     def __len__(self):
         assert len(self.features_files) == len(self.labels_files), \
@@ -101,9 +78,10 @@ class CustomDataset(Dataset):
     def __getitem__(self, idx):
         feature_file = self.features_files[idx]
         label_file = self.labels_files[idx]
-
-        features = np.load(os.path.join(self.features_dir, feature_file))
-        labels = np.load(os.path.join(self.labels_dir, label_file))
+        
+        features = feature_file
+        labels = label_file
+        
         return torch.from_numpy(features), torch.from_numpy(labels)
 
 
@@ -159,9 +137,8 @@ def main(args):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
 
     # Setup data:
-    features_dir = f"{args.feature_path}/imagenet256_features"
-    labels_dir = f"{args.feature_path}/imagenet256_labels"
-    dataset = CustomDataset(features_dir, labels_dir)
+    features_dir = args.feature_path
+    dataset = CustomDataset(features_dir)
     loader = DataLoader(
         dataset,
         batch_size=int(args.global_batch_size // accelerator.num_processes),
@@ -230,7 +207,7 @@ def main(args):
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if accelerator.is_main_process:
                     checkpoint = {
-                        "model": model.module.state_dict(),
+                        "model": model.state_dict(),
                         "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
                         "args": args
@@ -257,7 +234,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=1400)
     parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--global-seed", type=int, default=0)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=256)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
     args = parser.parse_args()

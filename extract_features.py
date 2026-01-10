@@ -8,15 +8,15 @@ import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 import torch.distributed as dist
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torchvision.datasets import ImageFolder
 from torchvision import transforms
 import numpy as np
 from PIL import Image
 import argparse
 import os
 from tqdm import tqdm
+from datasets import load_dataset
 
 from diffusers.models import AutoencoderKL
 
@@ -24,7 +24,6 @@ from diffusers.models import AutoencoderKL
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
-
 
 def cleanup():
     """
@@ -54,6 +53,18 @@ def center_crop_arr(pil_image, image_size):
     return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
 
+class CustomDataset(Dataset):
+    def __init__(self, ds, t):
+        self.ds = ds
+        self.t = t
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        return self.t(self.ds[idx]["jpg"].convert("RGB")), self.ds[idx]["cls"]
+
+
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
@@ -61,7 +72,7 @@ def center_crop_arr(pil_image, image_size):
 def main(args):
     """
     Trains a new DiT model.
-    """
+    """    
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
     # Setup DDP:
@@ -92,7 +103,11 @@ def main(args):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
-    dataset = ImageFolder(args.data_path, transform=transform)
+    dataset = CustomDataset(load_dataset(
+        "timm/imagenet-1k-wds",
+        split="train",
+        num_proc=16,
+    ), transform)
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
@@ -110,31 +125,24 @@ def main(args):
         drop_last=False
     )
 
-    train_steps = 0
+    xs, ys = [], []
     for x, y in tqdm(loader, total=len(loader), desc=f"Rank {rank}"):
         x = x.to(device)
-        y = y.to(device)
         with torch.no_grad():
             # Map input images to latent space + normalize latents:
             x = vae.encode(x).latent_dist.sample().mul_(0.18215)
             
-        x = x.detach().cpu().numpy()    # (bs, 4, 32, 32)
-        y = y.detach().cpu().numpy()    # (bs,)
-        for i in range(x.shape[0]):
-            # save_num = NUM_SAMPLES * rank + train_steps * local_batch_size + i
-            save_num = train_steps * args.global_batch_size + dist.get_world_size() * i + rank
-            np.save(f'{args.features_path}/imagenet256_features/{save_num}.npy', np.expand_dims(x[i], axis=0))
-            np.save(f'{args.features_path}/imagenet256_labels/{save_num}.npy', np.expand_dims(y[i], axis=0))
-            
-        train_steps += 1
-        # print(save_num)
+        xs.append(x.detach().cpu())  # (bs, 4, 32, 32)
+        ys.append(y)                 # (bs,)
 
+    np.save(f'{args.features_path}/imagenet256_features_all.npy', torch.vstack(xs).numpy())
+    np.save(f'{args.features_path}/imagenet256_labels_all.npy', torch.vstack(ys).numpy())
+    
     cleanup()
 
 if __name__ == "__main__":
     # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--features-path", type=str, default="features")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--global-batch-size", type=int, default=256)
