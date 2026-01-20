@@ -1,4 +1,8 @@
-# Modified from Meta's DiT repo: https://github.com/facebookresearch/DiT/tree/main
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
 # --------------------------------------------------------
 # References:
 # GLIDE: https://github.com/openai/glide-text2im
@@ -9,6 +13,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import math
+from typing import Optional, Literal
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 
 
@@ -98,14 +103,14 @@ class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, act_layer=lambda: nn.GELU(approximate="tanh"), norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6), **block_kwargs):
         super().__init__()
+        
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm2 = norm_layer(hidden_size)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=act_layer(), drop=0)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
@@ -154,6 +159,9 @@ class DiT(nn.Module):
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
+        
+        act_layer=lambda: nn.GELU(approximate="tanh"),
+        norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6),
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -170,7 +178,7 @@ class DiT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
+            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, act_layer=act_layer, norm_layer=norm_layer) for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()

@@ -39,7 +39,7 @@ def create_npz_from_sample_folder(sample_dir, num=50_000):
     return npz_path
 
 
-def main(args):
+def main(args, act_layer, norm_layer):
     """
     Run sampling.
     """
@@ -66,12 +66,16 @@ def main(args):
     if args.model in DiT_models:
         model = DiT_models[args.model](
             input_size=latent_size,
-            num_classes=args.num_classes
+            num_classes=args.num_classes,
+            act_layer=act_layer,
+            norm_layer=norm_layer,
         ).to(device)
     elif args.model in DiffiT_models:
         model = DiffiT_models[args.model](
             input_size=latent_size,
-            num_classes=args.num_classes
+            num_classes=args.num_classes,
+            act_layer=act_layer,
+            norm_layer=norm_layer,
         ).to(device)
     else:
         raise ValueError(f"Model {args.model} not found in DiT_models or DiffiT_models.")
@@ -88,7 +92,7 @@ def main(args):
     # Create folder to save samples:
     model_string_name = args.model.replace("/", "-")
     ckpt_string_name = os.path.basename(args.ckpt).replace(".pt", "") if args.ckpt else "pretrained"
-    folder_name = f"{model_string_name}-{ckpt_string_name}-size-{args.image_size}-vae-{args.vae}-" \
+    folder_name = f"{model_string_name}-{act_layer}-{norm_layer}-{ckpt_string_name}-size-{args.image_size}-vae-{args.vae}-" \
                   f"cfg-{args.cfg_scale}-seed-{args.global_seed}"
     sample_folder_dir = f"{args.sample_dir}/{folder_name}"
     if rank == 0:
@@ -110,7 +114,8 @@ def main(args):
     pbar = range(iterations)
     pbar = tqdm(pbar) if rank == 0 else pbar
     total = 0
-    for _ in pbar:
+    all_samples = np.zeros((total_samples, args.image_size, args.image_size, 3), dtype=np.uint8)
+    for epoch in pbar:
         # Sample inputs:
         z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
         y = torch.randint(0, args.num_classes, (n,), device=device)
@@ -135,17 +140,22 @@ def main(args):
 
         samples = vae.decode(samples / 0.18215).sample
         samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
+        all_samples[n * epoch : n * (epoch+1)] = samples
 
         # Save samples to disk as individual .png files
-        for i, sample in enumerate(samples):
-            index = i * dist.get_world_size() + rank + total
-            Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
+        if epoch == 0:
+            for i, sample in enumerate(samples):
+                index = i * dist.get_world_size() + rank + total
+                Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
         total += global_batch_size
 
     # Make sure all processes have finished saving their samples before attempting to convert to .npz
     dist.barrier()
     if rank == 0:
-        create_npz_from_sample_folder(sample_folder_dir, args.num_fid_samples)
+        # create_npz_from_sample_folder(sample_folder_dir, args.num_fid_samples)
+        npz_path = f"{sample_folder_dir}.npz"
+        np.savez(npz_path, arr_0=all_samples)
+        print(f"Saved .npz file to {npz_path} [shape={all_samples.shape}].")
         print("Done.")
     dist.barrier()
     dist.destroy_process_group()
@@ -156,7 +166,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()) + list(DiffiT_models.keys()), default="DiT-XL/2")
     parser.add_argument("--vae",  type=str, choices=["ema", "mse"], default="ema")
     parser.add_argument("--sample-dir", type=str, default="samples")
-    parser.add_argument("--per-proc-batch-size", type=int, default=32)
+    parser.add_argument("--per-proc-batch-size", type=int, default=125)
     parser.add_argument("--num-fid-samples", type=int, default=50_000)
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
@@ -167,5 +177,9 @@ if __name__ == "__main__":
                         help="By default, use TF32 matmuls. This massively accelerates sampling on Ampere GPUs.")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
+    
+    parser.add_argument("--act-layer", type=str, choices=["GeLU", "ReLU"], default="GeLU")
+    parser.add_argument("--norm-layer", type=str, choices=["LN", "LN_MQ50"], default="LN")
+    
     args = parser.parse_args()
-    main(args)
+    main(args, args.act_layer, args.norm_layer)

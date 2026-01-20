@@ -34,10 +34,10 @@ class LayerNormalization(nn.Module):
         return self.alpha * (x - mean) / (std + self.eps) + self.bias
 
 class MLP(nn.Module):
-  def __init__(self, img_size: int, d_ff: int): # d_ff: feed forward dimension
+  def __init__(self, img_size: int, d_ff: int, act_layer=lambda: nn.GELU()): # d_ff: feed forward dimension
     super().__init__()
     self.linear_1 = nn.Linear(img_size, d_ff)
-    self.gelu = nn.GELU()
+    self.gelu = act_layer()
     self.linear_2 = nn.Linear(d_ff, img_size)
 
   def forward(self, x):
@@ -136,11 +136,12 @@ class TMSA(nn.Module):
 
 
 class DiffiTBlock(nn.Module):
-  def __init__(self, d_model: int, num_heads: int, dropout: float, d_ff: int, img_size: int, label_size: int = None):
+  def __init__(self, d_model: int, num_heads: int, dropout: float, d_ff: int, img_size: int, label_size: int = None, act_layer=lambda: nn.GELU(approximate="tanh"), norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)):
     super().__init__()
-    self.ln = LayerNormalization()
+    self.tmsa_ln = LayerNormalization()
     self.tmsa = TMSA(d_model, num_heads, dropout, img_size)
-    self.mlp = MLP(img_size, d_ff)
+    self.mlp_ln = norm_layer(d_model)
+    self.mlp = MLP(img_size, d_ff, act_layer)
     self.time_embedding = TimeEmbedding(d_model, img_size*img_size)
 
     # Only for latent model
@@ -155,8 +156,8 @@ class DiffiTBlock(nn.Module):
     if l is not None:
       tmsa_comb += self.label_embedding(l)
 
-    xs1 = self.tmsa(self.ln(xs), tmsa_comb) + xs
-    xs2 = self.mlp(self.ln(xs1)) + xs1
+    xs1 = self.tmsa(self.tmsa_ln(xs), tmsa_comb) + xs
+    xs2 = self.mlp(self.mlp_ln(xs1)) + xs1
 
     return xs2
 
@@ -215,14 +216,14 @@ class TimeEmbedding(nn.Module):
 
 
 class DiffiTResBlock(nn.Module):
-  def __init__(self, in_channels: int, out_channels: int, num_heads: int, dropout: float, d_ff: int, img_size: int, label_size: int = None):
+  def __init__(self, in_channels: int, out_channels: int, num_heads: int, dropout: float, d_ff: int, img_size: int, label_size: int = None, act_layer=lambda: nn.GELU(approximate="tanh"), norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)):
     super().__init__()
     self.seq_len = img_size * img_size
 
     self.conv3x3 = nn.Conv2d(in_channels = in_channels, out_channels = out_channels, kernel_size = 3, padding = 1)
     self.swish = nn.SiLU()
     self.group_norm = nn.GroupNorm(num_groups = in_channels//4, num_channels = in_channels)
-    self.diffit_block = DiffiTBlock(out_channels, num_heads, dropout, d_ff, img_size, label_size)
+    self.diffit_block = DiffiTBlock(out_channels, num_heads, dropout, d_ff, img_size, label_size, act_layer=act_layer, norm_layer=norm_layer)
 
   def forward(self, xs, t, l=None):
     xs_1 = self.conv3x3(self.swish(self.group_norm(xs)))
@@ -264,10 +265,10 @@ class Upsample(nn.Module):
 
 
 class ResBlockGroup(nn.Module):
-  def __init__(self, num_heads: int, dropout: float, d_ff: int, L: int, in_channels: int, out_channels: int, img_size: int, label_size: int = None):
+  def __init__(self, num_heads: int, dropout: float, d_ff: int, L: int, in_channels: int, out_channels: int, img_size: int, label_size: int = None, act_layer=lambda: nn.GELU(approximate="tanh"), norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)):
     super().__init__()
     self.L = L
-    self.diffit_res_block = DiffiTResBlock(in_channels, out_channels, num_heads, dropout, d_ff, img_size, label_size)
+    self.diffit_res_block = DiffiTResBlock(in_channels, out_channels, num_heads, dropout, d_ff, img_size, label_size, act_layer=act_layer, norm_layer=norm_layer)
 
   def forward(self, x, t, l=None):
     for _ in range(self.L):
@@ -279,18 +280,18 @@ def p_losses(noise, predicted_noise):
   return F.smooth_l1_loss(noise, predicted_noise)
 
 class DiffiTEncoder(nn.Module):
-  def __init__(self, in_channels: int, d_model: int, num_heads: int, dropout: float, d_ff: int, img_size: int, label_size: int, L1: int = 4, L2: int = 4, L3: int = 4, L4: int = 4):
+  def __init__(self, in_channels: int, d_model: int, num_heads: int, dropout: float, d_ff: int, img_size: int, label_size: int, L1: int = 4, L2: int = 4, L3: int = 4, L4: int = 4, act_layer=lambda: nn.GELU(approximate="tanh"), norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)):
     super().__init__()
     d_model_2 = d_model*2
 
     self.tokenizer = Tokenizer(out_channels=d_model, in_channels=in_channels)
-    self.diffit_res_block_group_1 = ResBlockGroup(num_heads, dropout, d_ff, L1, in_channels=d_model, out_channels=d_model, img_size=img_size, label_size=label_size)
+    self.diffit_res_block_group_1 = ResBlockGroup(num_heads, dropout, d_ff, L1, in_channels=d_model, out_channels=d_model, img_size=img_size, label_size=label_size, act_layer=act_layer, norm_layer=norm_layer)
     self.downsample_1 = Downsample(in_channels=d_model, out_channels=d_model_2)
-    self.diffit_res_block_group_2 = ResBlockGroup(num_heads, dropout, d_ff, L2, in_channels=d_model_2, out_channels=d_model_2, img_size=img_size//2, label_size=label_size)
+    self.diffit_res_block_group_2 = ResBlockGroup(num_heads, dropout, d_ff, L2, in_channels=d_model_2, out_channels=d_model_2, img_size=img_size//2, label_size=label_size, act_layer=act_layer, norm_layer=norm_layer)
     self.downsample_2 = Downsample(in_channels=d_model_2, out_channels=d_model_2)
-    self.diffit_res_block_group_3 = ResBlockGroup(num_heads, dropout, d_ff, L3, in_channels=d_model_2, out_channels=d_model_2, img_size=img_size//4, label_size=label_size)
+    self.diffit_res_block_group_3 = ResBlockGroup(num_heads, dropout, d_ff, L3, in_channels=d_model_2, out_channels=d_model_2, img_size=img_size//4, label_size=label_size, act_layer=act_layer, norm_layer=norm_layer)
     self.downsample_3 = Downsample(in_channels=d_model_2, out_channels=d_model_2)
-    self.diffit_res_block_group_4 = ResBlockGroup(num_heads, dropout, d_ff, L4, in_channels=d_model_2, out_channels=d_model_2, img_size=img_size//8, label_size=label_size)
+    self.diffit_res_block_group_4 = ResBlockGroup(num_heads, dropout, d_ff, L4, in_channels=d_model_2, out_channels=d_model_2, img_size=img_size//8, label_size=label_size, act_layer=act_layer, norm_layer=norm_layer)
 
   def forward(self, x, t, l):
     out_1 = self.downsample_1(self.diffit_res_block_group_1(self.tokenizer(x), t, l))
@@ -300,16 +301,16 @@ class DiffiTEncoder(nn.Module):
 
 
 class DiffiTDecoder(nn.Module):
-  def __init__(self, out_channels: int, d_model: int, num_heads: int, dropout: float, d_ff: int, img_size: int, label_size: int, L1: int = 4, L2: int = 4, L3: int = 4):
+  def __init__(self, out_channels: int, d_model: int, num_heads: int, dropout: float, d_ff: int, img_size: int, label_size: int, L1: int = 4, L2: int = 4, L3: int = 4, act_layer=lambda: nn.GELU(approximate="tanh"), norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)):
     super().__init__()
     d_model_2 = d_model//2
 
     self.upsample_1 = Upsample(in_channels=d_model, out_channels=d_model)
-    self.diffit_res_block_group_3 = ResBlockGroup(num_heads, dropout, d_ff, L3, in_channels=d_model, out_channels=d_model, img_size=img_size//4, label_size=label_size)
+    self.diffit_res_block_group_3 = ResBlockGroup(num_heads, dropout, d_ff, L3, in_channels=d_model, out_channels=d_model, img_size=img_size//4, label_size=label_size, act_layer=act_layer, norm_layer=norm_layer)
     self.upsample_2 = Upsample(in_channels=d_model, out_channels=d_model)
-    self.diffit_res_block_group_2 = ResBlockGroup(num_heads, dropout, d_ff, L2, in_channels=d_model, out_channels=d_model, img_size=img_size//2, label_size=label_size)
+    self.diffit_res_block_group_2 = ResBlockGroup(num_heads, dropout, d_ff, L2, in_channels=d_model, out_channels=d_model, img_size=img_size//2, label_size=label_size, act_layer=act_layer, norm_layer=norm_layer)
     self.upsample_3 = Upsample(in_channels=d_model, out_channels=d_model_2)
-    self.diffit_res_block_group_1 = ResBlockGroup(num_heads, dropout, d_ff, L1, in_channels=d_model_2, out_channels=d_model_2, img_size=img_size, label_size=label_size)
+    self.diffit_res_block_group_1 = ResBlockGroup(num_heads, dropout, d_ff, L1, in_channels=d_model_2, out_channels=d_model_2, img_size=img_size, label_size=label_size, act_layer=act_layer, norm_layer=norm_layer)
     self.head = Head(in_channels=d_model_2, out_channels=out_channels)
 
   def forward(self, x, t, l):
@@ -320,10 +321,10 @@ class DiffiTDecoder(nn.Module):
 
 
 class LatentDiffiTTransformerBlock(nn.Module):
-  def __init__(self, d_model: int, num_heads: int, dropout: float, d_ff: int, N: int, img_size: int, label_size: int):
+  def __init__(self, d_model: int, num_heads: int, dropout: float, d_ff: int, N: int, img_size: int, label_size: int, act_layer=lambda: nn.GELU(approximate="tanh"), norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)):
     super().__init__()
     self.N = N
-    self.diffit_block = DiffiTBlock(d_model, num_heads, dropout, d_ff, img_size=img_size, label_size=label_size)
+    self.diffit_block = DiffiTBlock(d_model, num_heads, dropout, d_ff, img_size=img_size, label_size=label_size, act_layer=act_layer, norm_layer=norm_layer)
 
   def forward(self, xs, t, l):
     for _ in range(self.N):
@@ -396,6 +397,9 @@ class DiffiT(nn.Module):
       learn_sigma=True,
 
       stride = 2,
+      
+      act_layer=lambda: nn.GELU(approximate="tanh"),
+      norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6),
   ):
     super().__init__()
     self.learn_sigma = learn_sigma
@@ -409,11 +413,11 @@ class DiffiT(nn.Module):
     self.image_size_input_latent_block = (input_size // stride**3) // patch_size    # stride = 2 defined by the paper
     self.seq_len_input_latent_block = self.image_size_input_latent_block * self.image_size_input_latent_block
 
-    self.encoder = DiffiTEncoder(self.in_channels, hidden_size, num_heads, dropout, self.d_ff, img_size=input_size, label_size=num_classes)
+    self.encoder = DiffiTEncoder(self.in_channels, hidden_size, num_heads, dropout, self.d_ff, img_size=input_size, label_size=num_classes, act_layer=act_layer, norm_layer=norm_layer)
     self.patch_embedding = PatchEmbedding(input_size, patch_size, hidden_size*2)
-    self.latent_block = LatentDiffiTTransformerBlock(hidden_size*2, num_heads, dropout, self.d_ff, depth, img_size=self.image_size_input_latent_block, label_size=num_classes)
+    self.latent_block = LatentDiffiTTransformerBlock(hidden_size*2, num_heads, dropout, self.d_ff, depth, img_size=self.image_size_input_latent_block, label_size=num_classes, act_layer=act_layer, norm_layer=norm_layer)
     self.unpatchify = Unpatch(input_size, patch_size, hidden_size*2)
-    self.decoder = DiffiTDecoder(self.out_channels, hidden_size*2, num_heads, dropout, self.d_ff, img_size=input_size, label_size=num_classes)
+    self.decoder = DiffiTDecoder(self.out_channels, hidden_size*2, num_heads, dropout, self.d_ff, img_size=input_size, label_size=num_classes, act_layer=act_layer, norm_layer=norm_layer)
   def forward(self, x, t, y):
     # image --> encoder
     encoder_output = self.encoder(x, t, y)

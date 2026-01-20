@@ -7,11 +7,11 @@ import torch
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True  # Optimize for consistent input sizes
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from collections import OrderedDict
 from copy import deepcopy
-from glob import glob
 from time import time
 import argparse
 import logging
@@ -89,7 +89,7 @@ class CustomDataset(Dataset):
 #                                  Training Loop                                #
 #################################################################################
 
-def main(args):
+def main(args, act_layer, norm_layer):
     """
     Trains a new DiT model.
     """
@@ -102,9 +102,8 @@ def main(args):
     # Setup an experiment folder:
     if accelerator.is_main_process:
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
-        experiment_index = len(glob(f"{args.results_dir}/*"))
         model_string_name = args.model.replace("/", "-")  # e.g., DiT-XL/2 --> DiT-XL-2 (for naming folders)
-        experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}"  # Create an experiment folder
+        experiment_dir = f"{args.results_dir}/{model_string_name}-{act_layer}-{norm_layer}"  # Create an experiment folder
         checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
         os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
@@ -116,12 +115,16 @@ def main(args):
     if args.model in DiT_models:
         model = DiT_models[args.model](
             input_size=latent_size,
-            num_classes=args.num_classes
+            num_classes=args.num_classes,
+            act_layer=act_layer,
+            norm_layer=norm_layer,
         )
     elif args.model in DiffiT_models:
         model = DiffiT_models[args.model](
             input_size=latent_size,
-            num_classes=args.num_classes
+            num_classes=args.num_classes,
+            act_layer=act_layer,
+            norm_layer=norm_layer,
         )
     else:
         raise ValueError(f"Model {args.model} not found in DiT_models or DiffiT_models.")
@@ -237,5 +240,9 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=256)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
+    
+    parser.add_argument("--act-layer", type=str, choices=["GeLU", "ReLU"], default="GeLU")
+    parser.add_argument("--norm-layer", type=str, choices=["LN", "LN_MQ50"], default="LN")
+    
     args = parser.parse_args()
-    main(args)
+    main(args, args.act_layer, args.norm_layer)
