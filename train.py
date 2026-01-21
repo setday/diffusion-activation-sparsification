@@ -20,6 +20,8 @@ from accelerate import Accelerator
 
 from models.dit import DiT_models
 from models.diffit import DiffiT_models
+from moddifiers.activation import ACTIVATIONS
+from moddifiers.normalization import NORMALIZATIONS
 from diffusion import create_diffusion
 
 
@@ -116,15 +118,15 @@ def main(args, act_layer, norm_layer):
         model = DiT_models[args.model](
             input_size=latent_size,
             num_classes=args.num_classes,
-            act_layer=act_layer,
-            norm_layer=norm_layer,
+            act_layer=ACTIVATIONS[act_layer],
+            norm_layer=NORMALIZATIONS[norm_layer],
         )
     elif args.model in DiffiT_models:
         model = DiffiT_models[args.model](
             input_size=latent_size,
             num_classes=args.num_classes,
-            act_layer=act_layer,
-            norm_layer=norm_layer,
+            act_layer=ACTIVATIONS[act_layer],
+            norm_layer=NORMALIZATIONS[norm_layer],
         )
     else:
         raise ValueError(f"Model {args.model} not found in DiT_models or DiffiT_models.")
