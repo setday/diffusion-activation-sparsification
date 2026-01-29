@@ -12,11 +12,14 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from collections import OrderedDict
 from copy import deepcopy
+from glob import glob
 from time import time
 import argparse
 import logging
 import os
 from accelerate import Accelerator
+
+from download import find_model
 
 from models.dit import DiT_models
 from models.diffit import DiffiT_models
@@ -96,6 +99,7 @@ def main(args, act_layer, norm_layer):
     Trains a new DiT model.
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
+    
 
     # Setup accelerator:
     accelerator = Accelerator()
@@ -104,15 +108,19 @@ def main(args, act_layer, norm_layer):
     # Setup an experiment folder:
     if accelerator.is_main_process:
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
+        experiment_index = len(glob(f"{args.results_dir}/*"))
         model_string_name = args.model.replace("/", "-")  # e.g., DiT-XL/2 --> DiT-XL-2 (for naming folders)
-        experiment_dir = f"{args.results_dir}/{model_string_name}-{act_layer}-{norm_layer}"  # Create an experiment folder
+        experiment_dir = f"{args.results_dir}/FT-{model_string_name}-{act_layer}-{norm_layer}"  # Create an experiment folder
         checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
         os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
+        
+    ####################################################################
 
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
+    
     latent_size = args.image_size // 8
     if args.model in DiT_models:
         model = DiT_models[args.model](
@@ -130,6 +138,19 @@ def main(args, act_layer, norm_layer):
         )
     else:
         raise ValueError(f"Model {args.model} not found in DiT_models or DiffiT_models.")
+    
+    if args.ckpt is None:
+        assert args.model == "DiT-XL/2", "Only DiT-XL/2 models are available for auto-download."
+        assert args.image_size in [256, 512]
+        assert args.num_classes == 1000
+        
+    ckpt_path = args.ckpt or f"DiT-XL-2-{args.image_size}x{args.image_size}.pt"
+
+    # Load model:
+    state_dict = find_model(ckpt_path)
+    model.load_state_dict(state_dict)
+    
+    ######################################################################
     # Note that parameter initialization is done within the DiT constructor
     model = model.to(device)
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
@@ -139,7 +160,7 @@ def main(args, act_layer, norm_layer):
         logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0)
 
     # Setup data:
     features_dir = args.feature_path
@@ -228,7 +249,7 @@ def main(args, act_layer, norm_layer):
         logger.info("Done!")
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":    
     # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
     parser.add_argument("--feature-path", type=str, default="features")
@@ -236,12 +257,15 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()) + list(DiT_models.keys()), default="DiT-XL/2")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
-    parser.add_argument("--epochs", type=int, default=1400)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=256)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
+    
+    parser.add_argument("--ckpt", type=str, default=None,
+                        help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
     
     parser.add_argument("--act-layer", type=str, choices=["GeLU", "ReLU"], default="GeLU")
     parser.add_argument("--norm-layer", type=str, choices=["LayerNorm", "LayerNorm-MeanQuantile-50"], default="LayerNorm")

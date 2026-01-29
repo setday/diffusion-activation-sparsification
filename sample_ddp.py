@@ -181,7 +181,7 @@ if __name__ == "__main__":
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
     
     parser.add_argument("--act-layer", type=str, choices=["GeLU", "ReLU"], default="GeLU")
-    parser.add_argument("--norm-layer", type=str, choices=["LN", "LN_MQ50"], default="LN")
+    parser.add_argument("--norm-layer", type=str, choices=["LayerNorm", "LayerNorm-MeanQuantile-50"], default="LayerNorm")
     
     args = parser.parse_args()
     main(args, args.act_layer, args.norm_layer)
