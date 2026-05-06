@@ -1,530 +1,590 @@
+# DiffiT: Diffusion Vision Transformers for Image Generation
+# Based on: https://arxiv.org/abs/2312.02139
+#
+# This implementation targets LATENT diffusion (with VAE features),
+# compatible with the DiT training and sampling pipeline.
+#
+# Key difference from DiT: uses Time-dependent Multihead Self-Attention (TMSA)
+# which integrates temporal conditioning directly into Q/K/V projections,
+# instead of adaLN-Zero conditioning.
+
+from typing import Optional, Type
+
 import torch
 import torch.nn as nn
-import math
 import torch.nn.functional as F
+import torch.utils.checkpoint
+
+from timm.models.layers import resolve_self_attn_mask, maybe_add_mask
+from timm.models.vision_transformer import PatchEmbed
+
+try:
+    from flash_attn import flash_attn_qkvpacked_func
+    _HAS_FLASH_ATTN = True
+except ImportError:
+    _HAS_FLASH_ATTN = False
+
+from models.common_layers import (
+    Attention,
+    TimestepEmbedder,
+    LabelEmbedder,
+    FinalLayer,
+    get_2d_sincos_pos_embed,
+)
 
 
-def extract(a, t, x_shape):
-    batch_size = t.shape[0]
-    out = a.gather(-1, t.cpu())
-    return out.reshape(batch_size, *((1,) * (len(x_shape) - 1))).to(t.device)
-
-
-def linear_beta_schedule(timesteps):
-    beta_start = 0.0001
-    beta_end = 0.02
-    return torch.linspace(beta_start, beta_end, timesteps)
-
-# Taken from [3]
-def causal_mask(size):
-  mask = torch.triu(torch.ones(1, size, size), diagonal=1).type(torch.int)
-  return mask == 0
-
-
-class LayerNormalization(nn.Module):
-    def __init__(self, eps: float = 10**-6):
-        super().__init__()
-        self.eps = eps
-        self.alpha = nn.Parameter(torch.ones(1))    # Multiplies
-        self.bias = nn.Parameter(torch.zeros(1))    # Added
-
-    def forward(self, x):
-        mean = x.mean(dim = -1, keepdim = True)
-        std = x.std(dim = -1, keepdim = True)
-        return self.alpha * (x - mean) / (std + self.eps) + self.bias
-
-class MLP(nn.Module):
-  def __init__(self, img_size: int, d_ff: int, act_layer=lambda: nn.GELU()): # d_ff: feed forward dimension
-    super().__init__()
-    self.linear_1 = nn.Linear(img_size, d_ff)
-    self.gelu = act_layer()
-    self.linear_2 = nn.Linear(d_ff, img_size)
-
-  def forward(self, x):
-    out_linear_1 = self.linear_1(x)
-    out_gelu = self.gelu(out_linear_1)
-    out_linear_2 = self.linear_2(out_gelu)
-    return out_linear_2
-
+#################################################################################
+#                          Core DiffiT Components                               #
+#################################################################################
 
 class TMSA(nn.Module):
-  def __init__(self, d_model: int, num_heads: int, dropout: float, img_size: int):    # d_model = space_embedding_size = time_embedding_size
-    super().__init__()
-    self.space_embedding_size = d_model
-    self.time_embedding_size = d_model
-    self.d_model = d_model
-    self.num_heads = num_heads
-    self.seq_len = img_size * img_size
-    self.img_size = img_size
-    self.d = d_model // num_heads
-    self.mask = causal_mask(self.seq_len)
-    assert d_model % num_heads == 0, 'space_embedding_size is not divisible by num_heads!'
+    """
+    Time-dependent Multihead Self-Attention (DiffiT paper, Section 3.1).
 
-    # Linear projections for xs
-    self.Wqs = nn.Linear(d_model, d_model, bias = False) # y = x*A^T + b  => A^T = (space_embedding_size, space_embedding_size), Wqs = A^T
-    self.Wks = nn.Linear(d_model, d_model, bias = False)
-    self.Wvs = nn.Linear(d_model, d_model, bias = False)
+    Key differences from standard attention:
+    1. Temporal Q/K/V are derived from the conditioning signal and added
+       to spatial Q/K/V before computing attention.
+    2. A learned relative position bias w^K is applied to attention logits.
+    """
+    def __init__(
+            self,
+            dim: int,
+            num_heads: int = 8,
+            seq_len: int = 1024,
+            attn_head_dim: Optional[int] = None,
+            dim_out: Optional[int] = None,
+            qkv_bias: bool = False,
+            qk_norm: bool = False,
+            scale_norm: bool = False,
+            proj_bias: bool = True,
+            attn_drop: float = 0.,
+            proj_drop: float = 0.,
+            norm_layer: Optional[Type[nn.Module]] = None,
+            lin_layer = nn.Linear,
+            device=None,
+            dtype=None,
+        ):
+        super().__init__()
+        dd = {'device': device, 'dtype': dtype}
+        dim_out = dim_out or dim
+        head_dim = attn_head_dim
+        if head_dim is None:
+            assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+            head_dim = dim // num_heads
+        if qk_norm or scale_norm:
+            assert norm_layer is not None, 'norm_layer must be provided if qk_norm or scale_norm is True'
 
-    # Linear projections for xt
-    self.Wqt = nn.Linear(d_model, d_model, bias = False)
-    self.Wkt = nn.Linear(d_model, d_model, bias = False)
-    self.Wvt = nn.Linear(d_model, d_model, bias = False)
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.attn_dim = num_heads * head_dim
+        self.scale = head_dim ** -0.5
+        self.fused_attn = Attention._use_fused_attn()
+        
+        self.seq_len = seq_len
 
-    self.WK = nn.Linear(self.d, self.seq_len, bias = False) # y = x*A^T + b, A^T = w^K
+        # Spatial Q/K/V projections
+        self.Ws = lin_layer(dim, self.attn_dim * 3, bias=qkv_bias, **dd)
 
-    self.wo = nn.Linear(d_model, d_model, bias=False) # Wo
+        # Temporal Q/K/V projections
+        self.Wt = lin_layer(dim, self.attn_dim * 3, bias=False, **dd)
 
-    self.dropout = nn.Dropout(dropout)
+        # QK-Norm: normalize Q and K per head to prevent attention logit overflow
+        # (essential for fp16/bf16 training stability in deep transformers)
+        self.q_norm = norm_layer(head_dim, **dd) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(head_dim, **dd) if qk_norm else nn.Identity()
 
-  @staticmethod
-  def compute_attention_scores(query, key, value, wK, mask, dropout: nn.Dropout):
-    d = query.shape[-1]
+        # Learned relative position bias w^K (Eq. 5 in the paper):
+        # maps each query vector to position-dependent attention bias
+        self.WK = lin_layer(self.head_dim, seq_len, bias=False)
 
-    attention_scores = ((query @ key.transpose(-2, -1) + wK(query)) / math.sqrt(d))
+        # Output projection
+        self.wo = lin_layer(dim, dim, bias=proj_bias, **dd)
+        
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.norm = norm_layer(self.attn_dim, **dd) if scale_norm else nn.Identity()
+        self.proj_drop = nn.Dropout(proj_drop)
 
-    # Apply mask if required
-    if mask is not None:
-      attention_scores.masked_fill_(mask == 0, -1e9)
+    def forward(
+        self,
+        xs: torch.Tensor,
+        xt: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        is_causal: bool = False,
+    ) -> torch.Tensor:
+        """
+        Args:
+            xs: (B, S, C) spatial token features
+            xt: (B, C) temporal conditioning vector (t_emb + y_emb)
+            attn_mask: optional attention mask (e.g. for causal attention)
+            is_causal: whether to apply causal masking (for autoregressive decoding)
+        Returns:
+            (B, S, C) attention output
+        """
+        B, N, C = xs.shape
 
-    # Apply softmax
-    attention_scores = F.softmax(attention_scores, dim = -1)
+        # Spatial Q/K/V: (B, S, C)
+        qkvs = self.qkv(xs)
 
-    # Apply dropout if required
-    if dropout is not None:
-      attention_scores = dropout(attention_scores)
+        # Temporal Q/K/V: (B, C) -> (B, 1, C), broadcast across positions
+        qkvt = self.Wt(xt).reshape(B, 1, self.attn_dim * 3)
+        
+        # Combine spatial + temporal (Eq. 4 in the paper)
+        qkv = (qkvs + qkvt).reshape(B, N, 3, self.num_heads, self.head_dim)
 
-    # return here
-    return attention_scores @ value # ,attention_scores for visualization
+        if _HAS_FLASH_ATTN and x.dtype in [torch.float16, torch.bfloat16] and x.device.type == 'cuda':
+            # qkv shape requirement for flash_attn_qkvpacked_func: (B, N, 3, H, D)
+            # FIXME: Add this to selector
+            assert isinstance(self.q_norm, nn.Module) and isinstance(self.k_norm, nn.Module), "Flash Attention requires qk_norm to be True with a valid norm_layer"
+            assert attn_mask is None, "Flash Attention does not currently support attention masks"
 
-  def forward(self, xs, xt):
-    xs = xs.view(xs.shape[0], self.seq_len, xs.shape[1])
+            pos_bias_k = self.WK.weight.reshape(1, self.seq_len, 1, 1, self.head_dim)
+            pos_bias_qv = torch.zeros_like(pos_bias_k)
+            pos_bias_qkv = torch.cat([pos_bias_qv, pos_bias_k, pos_bias_qv], dim=2) # (1, seq_len, 3, 1, head_dim)
 
-    # Space query, key and value
-    query_s = self.Wqs(xs)      # query.shape: (batch, seq_len, d_model)
-    key_s = self.Wks(xs)
-    value_s = self.Wvs(xs)
+            qkv = qkv + pos_bias_qkv
 
-    qs_1 = query_s.view(query_s.shape[0], query_s.shape[1], self.num_heads, self.d).transpose(1, 2)
-    ks_1 = key_s.view(key_s.shape[0], key_s.shape[1], self.num_heads, self.d).transpose(1, 2)
-    vs_1 = value_s.view(value_s.shape[0], value_s.shape[1], self.num_heads, self.d).transpose(1, 2)
+            x = flash_attn_qkvpacked_func(
+                qkv, 
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+                softmax_scale=self.scale,
+                causal=is_causal
+            )
+        else:
+            qkv = qkv.permute(2, 0, 3, 1, 4)
+            q, k, v = qkv.unbind(0)
+            q, k = self.q_norm(q), self.k_norm(k)
+            
+            k = k + self.WK.weight # adding pos_bias directly to k is mathematically equivalent to attn + self.WK(q) and more efficient
 
-    # Temporal query, key and value
-    query_t = self.Wqt(xt)
-    key_t = self.Wkt(xt)
-    value_t = self.Wvt(xt)
+            # Fall back to PyTorch's native scaled dot product attention
+            # (Which also uses FlashAttention underneath if conditions are right on PyTorch 2.0+)
+            if self.fused_attn:
+                x = F.scaled_dot_product_attention(
+                    q, k, v,
+                    dropout_p=self.attn_drop.p if self.training else 0.0,
+                    scale=self.scale,
+                    is_causal=is_causal
+                )
+            else:
+                q = q * self.scale
+                attn = q @ k.transpose(-2, -1)
+                attn_bias = resolve_self_attn_mask(N, attn, attn_mask, is_causal)
+                attn = maybe_add_mask(attn, attn_bias)
+                attn = attn.softmax(dim=-1)
+                attn = self.attn_drop(attn)
+                x = attn @ v
 
-    qt_1 = query_t.view(query_t.shape[0], -1, self.num_heads, self.d).transpose(1, 2)
-    kt_1 = key_t.view(key_t.shape[0], -1, self.num_heads, self.d).transpose(1, 2)
-    vt_1 = value_t.view(value_t.shape[0], -1, self.num_heads, self.d).transpose(1, 2)
+            x = x.transpose(1, 2)
 
-    # Concatenation
-    qs = qs_1 + qt_1
-    ks = ks_1 + kt_1
-    vs = vs_1 + vt_1
-
-    # Compute attention scores
-    h = self.compute_attention_scores(qs, ks, vs, self.WK, self.mask, self.dropout)
-
-    # Combine all the heads together
-    h = h.transpose(1, 2).contiguous().view(h.shape[0], -1, self.num_heads * self.d)
-
-    output = self.wo(h)
-    output = output.view(h.shape[0], h.shape[2], int(math.sqrt(h.shape[1])), -1)
-
-    # Multiply by Wo
-    return output
+        x = x.reshape(B, N, self.attn_dim)
+        x = self.norm(x)
+        x = self.wo(x)
+        x = self.proj_drop(x)
+        return x
 
 
 class DiffiTBlock(nn.Module):
-  def __init__(self, d_model: int, num_heads: int, dropout: float, d_ff: int, img_size: int, label_size: int = None, act_layer=lambda: nn.GELU(approximate="tanh"), norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)):
-    super().__init__()
-    self.tmsa_ln = LayerNormalization()
-    self.tmsa = TMSA(d_model, num_heads, dropout, img_size)
-    self.mlp_ln = norm_layer(d_model)
-    self.mlp = MLP(img_size, d_ff, act_layer)
-    self.time_embedding = TimeEmbedding(d_model, img_size*img_size)
+    """
+    A DiffiT transformer block with TMSA and MLP.
 
-    # Only for latent model
-    if label_size is not None:
-      self.label_size = label_size
-      self.label_embedding = LabelEmbedding(label_size, d_model)
+    Unlike DiT which uses adaLN-Zero conditioning, DiffiT integrates
+    temporal information directly into the attention mechanism via TMSA.
+    """
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, seq_len=256,
+                 act_layer=lambda: nn.GELU(approximate="tanh"),
+                 norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6),
+                 lin_layer=nn.Linear):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.tmsa = TMSA(hidden_size, num_heads, seq_len, lin_layer=lin_layer)
+        self.norm2 = norm_layer(hidden_size)
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.mlp = nn.Sequential(
+            lin_layer(hidden_size, mlp_hidden_dim),
+            act_layer(),
+            lin_layer(mlp_hidden_dim, hidden_size),
+        )
 
-  def forward(self, xs, t, l=None):
-    xt = self.time_embedding(t)
-    tmsa_comb = xt
+    def forward(self, x, c):
+        """
+        Args:
+            x: (B, S, C) token features
+            c: (B, C) conditioning vector (t_emb + y_emb)
+        """
+        norm1_out = self.norm1(x)
+        tmsa_out = self.tmsa(norm1_out, c)
+        x = x + tmsa_out
 
-    if l is not None:
-      tmsa_comb += self.label_embedding(l)
+        norm2_out = self.norm2(x)
+        mlp_out = self.mlp(norm2_out)
+        x = x + mlp_out
 
-    xs1 = self.tmsa(self.tmsa_ln(xs), tmsa_comb) + xs
-    xs2 = self.mlp(self.mlp_ln(xs1)) + xs1
-
-    return xs2
-
-class Tokenizer(nn.Module):
-  def __init__(self, out_channels: int, in_channels: int):
-    super().__init__()
-    self.conv3x3 = nn.Conv2d(in_channels = in_channels, out_channels = out_channels, kernel_size = 3, padding = 1)
-
-  def forward(self, x):
-    return self.conv3x3(x)
-
-
-class Head(nn.Module):
-  def __init__(self, in_channels: int, out_channels: int):
-    super().__init__()
-    self.group_norm = nn.GroupNorm(num_groups=in_channels//4, num_channels=in_channels)
-    self.conv3x3 = nn.Conv2d(in_channels = in_channels, out_channels = out_channels, kernel_size = 3, padding = 1)
-
-  def forward(self, x):
-    return self.conv3x3(self.group_norm(x))
+        return x
 
 
-# From paragraph 3.2 of the DiffiT paper; implementation from the HuggingFace blog (https://huggingface.co/blog/annotated-diffusion)
-class SinusoidalPositionEmbeddings(nn.Module):
-    def __init__(self, dim):
-      super().__init__()
-      self.dim = dim
-
-    def forward(self, time):
-      device = time.device
-      half_dim = self.dim // 2
-
-      embeddings = math.log(10000) / (half_dim - 1)
-      embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
-      embeddings = time[:, None] * embeddings[None, :]
-      embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
-      return embeddings
-
-
-# From paragraph 3.2 of the DiffiT paper
-class TimeEmbedding(nn.Module):
-  def __init__(self, d_model: int, seq_len: int):
-    super().__init__()
-    self.seq_len = seq_len
-    self.d_model = d_model
-
-    self.time_embedding_mlp = nn.Sequential(
-        SinusoidalPositionEmbeddings(seq_len),
-        nn.Linear(seq_len, d_model),
-        nn.SiLU(),
-        nn.Linear(d_model, d_model)
-    )
-
-  def forward(self, time_steps):
-    return self.time_embedding_mlp(time_steps) # (batch, seq_len, d_model)
-
+###############################################################################
 
 class DiffiTResBlock(nn.Module):
-  def __init__(self, in_channels: int, out_channels: int, num_heads: int, dropout: float, d_ff: int, img_size: int, label_size: int = None, act_layer=lambda: nn.GELU(approximate="tanh"), norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)):
-    super().__init__()
-    self.seq_len = img_size * img_size
+    def __init__(self, in_channels: int, out_channels: int, num_heads: int, dropout: float, d_ff: int, img_size: int, label_size: int = None, act_layer=lambda: nn.GELU(approximate="tanh"), norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6), lin_layer=nn.Linear):
+        super().__init__()
+        self.seq_len = img_size * img_size
 
-    self.conv3x3 = nn.Conv2d(in_channels = in_channels, out_channels = out_channels, kernel_size = 3, padding = 1)
-    self.swish = nn.SiLU()
-    self.group_norm = nn.GroupNorm(num_groups = in_channels//4, num_channels = in_channels)
-    self.diffit_block = DiffiTBlock(out_channels, num_heads, dropout, d_ff, img_size, label_size, act_layer=act_layer, norm_layer=norm_layer)
+        self.conv3x3 = nn.Conv2d(in_channels = in_channels, out_channels = out_channels, kernel_size = 3, padding = 1)
+        self.swish = nn.SiLU()
+        self.group_norm = nn.GroupNorm(num_groups = in_channels//4, num_channels = in_channels)
+        self.diffit_block = DiffiTBlock(out_channels, num_heads, dropout, d_ff, img_size, label_size, act_layer=act_layer, norm_layer=norm_layer, lin_layer=lin_layer)
 
-  def forward(self, xs, t, l=None):
-    xs_1 = self.conv3x3(self.swish(self.group_norm(xs)))
-    xs = xs + self.diffit_block(xs_1, t, l)
+    def forward(self, xs, t, l=None):
+        xs_1 = self.conv3x3(self.swish(self.group_norm(xs)))
+        xs = xs + self.diffit_block(xs_1, t, l)
 
-    return xs
+        return xs
 
 
 # From page 14 of the DiffiT paper
 class Downsample(nn.Module):
-  def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, stride: int = 2, padding: int = 1):
-    super().__init__()
-    self.conv = nn.Conv2d(
-        in_channels = in_channels,
-        out_channels = out_channels,
-        kernel_size = kernel_size,
-        stride = stride,
-        padding = padding
-    )
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, stride: int = 2, padding: int = 1):
+        super().__init__()
+        self.conv = nn.Conv2d(
+            in_channels = in_channels,
+            out_channels = out_channels,
+            kernel_size = kernel_size,
+            stride = stride,
+            padding = padding
+        )
 
-  def forward(self, x):
-    return self.conv(x)
+    def forward(self, x):
+        return self.conv(x)
 
 
 class Upsample(nn.Module):
-  def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, stride: int = 2, padding: int = 1, output_padding: int = 1):
-    super().__init__()
-    self.conv = nn.ConvTranspose2d(
-        in_channels = in_channels,
-        out_channels = out_channels,
-        kernel_size = kernel_size,
-        stride = stride,
-        padding = padding,
-        output_padding = output_padding
-    )
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, stride: int = 2, padding: int = 1, output_padding: int = 1):
+        super().__init__()
+        self.conv = nn.ConvTranspose2d(
+            in_channels = in_channels,
+            out_channels = out_channels,
+            kernel_size = kernel_size,
+            stride = stride,
+            padding = padding,
+            output_padding = output_padding
+        )
 
-  def forward(self, x):
-    return self.conv(x)
+    def forward(self, x):
+        return self.conv(x)
 
 
 class ResBlockGroup(nn.Module):
-  def __init__(self, num_heads: int, dropout: float, d_ff: int, L: int, in_channels: int, out_channels: int, img_size: int, label_size: int = None, act_layer=lambda: nn.GELU(approximate="tanh"), norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)):
-    super().__init__()
-    self.L = L
-    self.diffit_res_block = DiffiTResBlock(in_channels, out_channels, num_heads, dropout, d_ff, img_size, label_size, act_layer=act_layer, norm_layer=norm_layer)
+    def __init__(self, L: int, in_channels: int, out_channels: int, num_heads: int, dropout: float, d_ff: int, img_size: int, label_size: int = None, act_layer=lambda: nn.GELU(approximate="tanh"), norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)):
+        super().__init__()
+        self.diffit_res_block = nn.ModuleList([
+            DiffiTResBlock(in_channels, out_channels, num_heads, dropout, d_ff, img_size, label_size, act_layer=act_layer, norm_layer=norm_layer)
+            for _ in range(L)
+        ])
 
-  def forward(self, x, t, l=None):
-    for _ in range(self.L):
-      x = self.diffit_res_block(x, t, l)
-    return x
+    def ckpt_wrapper(self, module):
+        def ckpt_forward(*inputs):
+            outputs = module(*inputs)
+            return outputs
+        return ckpt_forward
 
-def p_losses(noise, predicted_noise):
-  # return F.mse_loss(noise, predicted_noise)
-  return F.smooth_l1_loss(noise, predicted_noise)
+    def forward(self, x, t, l=None):
+        for block in self.diffit_res_block:
+            x = torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(block), x, t, l)
+        return x
+
+
 
 class DiffiTEncoder(nn.Module):
-  def __init__(self, in_channels: int, d_model: int, num_heads: int, dropout: float, d_ff: int, img_size: int, label_size: int, L1: int = 4, L2: int = 4, L3: int = 4, L4: int = 4, act_layer=lambda: nn.GELU(approximate="tanh"), norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)):
-    super().__init__()
-    d_model_2 = d_model*2
+    def __init__(self, d_model: int, num_heads: int, dropout: float, d_ff: int, img_size: int, label_size: int, L1: int = 4, L2: int = 4, L3: int = 4, act_layer=lambda: nn.GELU(approximate="tanh"), norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)):
+        super().__init__()
+        d_model_2 = d_model*2
 
-    self.tokenizer = Tokenizer(out_channels=d_model, in_channels=in_channels)
-    self.diffit_res_block_group_1 = ResBlockGroup(num_heads, dropout, d_ff, L1, in_channels=d_model, out_channels=d_model, img_size=img_size, label_size=label_size, act_layer=act_layer, norm_layer=norm_layer)
-    self.downsample_1 = Downsample(in_channels=d_model, out_channels=d_model_2)
-    self.diffit_res_block_group_2 = ResBlockGroup(num_heads, dropout, d_ff, L2, in_channels=d_model_2, out_channels=d_model_2, img_size=img_size//2, label_size=label_size, act_layer=act_layer, norm_layer=norm_layer)
-    self.downsample_2 = Downsample(in_channels=d_model_2, out_channels=d_model_2)
-    self.diffit_res_block_group_3 = ResBlockGroup(num_heads, dropout, d_ff, L3, in_channels=d_model_2, out_channels=d_model_2, img_size=img_size//4, label_size=label_size, act_layer=act_layer, norm_layer=norm_layer)
-    self.downsample_3 = Downsample(in_channels=d_model_2, out_channels=d_model_2)
-    self.diffit_res_block_group_4 = ResBlockGroup(num_heads, dropout, d_ff, L4, in_channels=d_model_2, out_channels=d_model_2, img_size=img_size//8, label_size=label_size, act_layer=act_layer, norm_layer=norm_layer)
+        self.diffit_res_block_group_1 = ResBlockGroup(L1, d_model, d_model, num_heads, dropout, d_ff, img_size=img_size, label_size=label_size, act_layer=act_layer, norm_layer=norm_layer)
+        self.downsample_1 = Downsample(in_channels=d_model, out_channels=d_model_2)
+        self.diffit_res_block_group_2 = ResBlockGroup(L2, d_model_2, d_model_2, num_heads, dropout, d_ff, img_size=img_size//2, label_size=label_size, act_layer=act_layer, norm_layer=norm_layer)
+        self.downsample_2 = Downsample(in_channels=d_model_2, out_channels=d_model_2)
+        self.diffit_res_block_group_3 = ResBlockGroup(L3, d_model_2, d_model_2, num_heads, dropout, d_ff, img_size=img_size//4, label_size=label_size, act_layer=act_layer, norm_layer=norm_layer)
+        self.downsample_3 = Downsample(in_channels=d_model_2, out_channels=d_model_2)
 
-  def forward(self, x, t, l):
-    out_1 = self.downsample_1(self.diffit_res_block_group_1(self.tokenizer(x), t, l))
-    out_2 = self.downsample_2(self.diffit_res_block_group_2(out_1, t, l))
-    out_3 = self.diffit_res_block_group_4(self.downsample_3(self.diffit_res_block_group_3(out_2, t, l)), t, l)
-    return out_3
+    def forward(self, x, t, l):
+        out_1 = self.downsample_1(self.diffit_res_block_group_1(x, t, l))
+        out_2 = self.downsample_2(self.diffit_res_block_group_2(out_1, t, l))
+        out_3 = self.downsample_3(self.diffit_res_block_group_3(out_2, t, l))
+        return [out_1, out_2, out_3]
 
 
 class DiffiTDecoder(nn.Module):
-  def __init__(self, out_channels: int, d_model: int, num_heads: int, dropout: float, d_ff: int, img_size: int, label_size: int, L1: int = 4, L2: int = 4, L3: int = 4, act_layer=lambda: nn.GELU(approximate="tanh"), norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)):
-    super().__init__()
-    d_model_2 = d_model//2
+    def __init__(self, d_model: int, num_heads: int, dropout: float, d_ff: int, img_size: int, label_size: int, L1: int = 4, L2: int = 4, L3: int = 4, act_layer=lambda: nn.GELU(approximate="tanh"), norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)):
+        super().__init__()
+        d_model_2 = d_model*2
 
-    self.upsample_1 = Upsample(in_channels=d_model, out_channels=d_model)
-    self.diffit_res_block_group_3 = ResBlockGroup(num_heads, dropout, d_ff, L3, in_channels=d_model, out_channels=d_model, img_size=img_size//4, label_size=label_size, act_layer=act_layer, norm_layer=norm_layer)
-    self.upsample_2 = Upsample(in_channels=d_model, out_channels=d_model)
-    self.diffit_res_block_group_2 = ResBlockGroup(num_heads, dropout, d_ff, L2, in_channels=d_model, out_channels=d_model, img_size=img_size//2, label_size=label_size, act_layer=act_layer, norm_layer=norm_layer)
-    self.upsample_3 = Upsample(in_channels=d_model, out_channels=d_model_2)
-    self.diffit_res_block_group_1 = ResBlockGroup(num_heads, dropout, d_ff, L1, in_channels=d_model_2, out_channels=d_model_2, img_size=img_size, label_size=label_size, act_layer=act_layer, norm_layer=norm_layer)
-    self.head = Head(in_channels=d_model_2, out_channels=out_channels)
+        self.upsample_1 = Upsample(in_channels=d_model_2, out_channels=d_model_2)
+        self.diffit_res_block_group_3 = ResBlockGroup(L3, d_model_2, d_model_2, num_heads, dropout, d_ff, img_size=img_size//4, label_size=label_size, act_layer=act_layer, norm_layer=norm_layer)
+        self.upsample_2 = Upsample(in_channels=d_model_2, out_channels=d_model_2)
+        self.diffit_res_block_group_2 = ResBlockGroup(L2, d_model_2, d_model_2, num_heads, dropout, d_ff, img_size=img_size//2, label_size=label_size, act_layer=act_layer, norm_layer=norm_layer)
+        self.upsample_3 = Upsample(in_channels=d_model_2, out_channels=d_model)
+        self.diffit_res_block_group_1 = ResBlockGroup(L1, d_model, d_model, num_heads, dropout, d_ff, img_size=img_size, label_size=label_size, act_layer=act_layer, norm_layer=norm_layer)
 
-  def forward(self, x, t, l):
-    out_1 = self.upsample_1(x)
-    out_2 = self.upsample_2(self.diffit_res_block_group_3(out_1, t, l))
-    out_3 = self.diffit_res_block_group_1(self.upsample_3(self.diffit_res_block_group_2(out_2, t, l)), t, l)
-    return self.head(out_3)
-
-
-class LatentDiffiTTransformerBlock(nn.Module):
-  def __init__(self, d_model: int, num_heads: int, dropout: float, d_ff: int, N: int, img_size: int, label_size: int, act_layer=lambda: nn.GELU(approximate="tanh"), norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)):
-    super().__init__()
-    self.N = N
-    self.diffit_block = DiffiTBlock(d_model, num_heads, dropout, d_ff, img_size=img_size, label_size=label_size, act_layer=act_layer, norm_layer=norm_layer)
-
-  def forward(self, xs, t, l):
-    for _ in range(self.N):
-      xs = self.diffit_block(xs, t, l)
-    return xs
-
-
-class LabelEmbedding(nn.Module):
-  def __init__(self, label_size: int, d_model: int):
-    super().__init__()
-    self.label_size = label_size
-
-    self.embedding_layer = nn.Embedding(label_size, d_model)
-    self.linear_layer = nn.Linear(d_model, d_model)
-
-  def forward(self, l):
-    return self.linear_layer(self.embedding_layer(l))
-
-
-# Adapted from [6]
-class PatchEmbedding(nn.Module):
-    def __init__(self, img_size, patch_size, embed_dim):
-      super().__init__()
-      assert (img_size % patch_size == 0), 'img_size is not divisible by patch_size!'
-
-      self.proj = nn.Conv2d(
-          in_channels = embed_dim,
-          out_channels = embed_dim,
-          kernel_size = patch_size,         # The receptive field will contain exactly one patch at a time
-          stride = patch_size,              # No overlapping between patches; each patch is processed in isolation
-      )
-
-    def forward(self, x):
-      # x.shape = (n_samples, in_channels, img_size, img_size)
-      x = self.proj(x)   # (n_samples, embed_dim, n_patches ** 0.5, n_patches ** 0.5)
-      return x
-
-
-# Adapted from [6]
-class Unpatch(nn.Module):
-  def __init__(self, img_size, patch_size, embed_dim):
-    super().__init__()
-    assert (img_size % patch_size == 0), 'img_size is not divisible by patch_size!'
-
-    self.proj = nn.ConvTranspose2d(
-        in_channels = embed_dim,
-        out_channels = embed_dim,
-        kernel_size = patch_size,
-        stride = patch_size
-    )
-
-  def forward(self, x):
-    # x.shape = (n_samples, n_patches, embed_dim)
-    x = self.proj(x)  # (n_samples, out_channels, img_size, img_size)
-    return x
-
-
-class DiffiT(nn.Module):
-  def __init__(
-      self,
-      input_size=32,
-      patch_size=2,
-      in_channels=4,
-      hidden_size=1152,
-      depth=30,
-      num_heads=16,
-      mlp_ratio=4.0,
-      dropout=0.1,
-      num_classes=1000,
-      learn_sigma=True,
-
-      stride = 2,
-      
-      act_layer=lambda: nn.GELU(approximate="tanh"),
-      norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6),
-  ):
-    super().__init__()
-    self.learn_sigma = learn_sigma
-    self.in_channels = in_channels
-    self.out_channels = in_channels * 2 if learn_sigma else in_channels
-    self.patch_size = patch_size
-    self.num_heads = num_heads
-    self.label_size = num_classes
-    self.d_ff = hidden_size * mlp_ratio
-
-    self.image_size_input_latent_block = (input_size // stride**3) // patch_size    # stride = 2 defined by the paper
-    self.seq_len_input_latent_block = self.image_size_input_latent_block * self.image_size_input_latent_block
-
-    self.encoder = DiffiTEncoder(self.in_channels, hidden_size, num_heads, dropout, self.d_ff, img_size=input_size, label_size=num_classes, act_layer=act_layer, norm_layer=norm_layer)
-    self.patch_embedding = PatchEmbedding(input_size, patch_size, hidden_size*2)
-    self.latent_block = LatentDiffiTTransformerBlock(hidden_size*2, num_heads, dropout, self.d_ff, depth, img_size=self.image_size_input_latent_block, label_size=num_classes, act_layer=act_layer, norm_layer=norm_layer)
-    self.unpatchify = Unpatch(input_size, patch_size, hidden_size*2)
-    self.decoder = DiffiTDecoder(self.out_channels, hidden_size*2, num_heads, dropout, self.d_ff, img_size=input_size, label_size=num_classes, act_layer=act_layer, norm_layer=norm_layer)
-  def forward(self, x, t, y):
-    # image --> encoder
-    encoder_output = self.encoder(x, t, y)
-    # encoder --> patch embedding
-    patch_embedding_output = self.patch_embedding(encoder_output)
-    # patch embedding --> latent block
-    latent_block_output = self.latent_block(patch_embedding_output, t, y)
-    # latent block --> unpatchify
-    unpatchify_output = self.unpatchify(latent_block_output)
-    # unpatchify --> decoder
-    decoder_output = self.decoder(unpatchify_output, t, y)
-    # decoder --> image
-    return decoder_output
-
-class UShapedNetwork(nn.Module):
-  def __init__(
-      self,
-      input_size=32,
-      in_channels=4,
-      hidden_size=1152,
-      num_heads=16,
-      mlp_ratio=4.0,
-      dropout=0.1,
-      learn_sigma=True,
-
-      L1: int = 2,
-      L2: int = 2,
-      L3: int = 2,
-      L4: int = 2
-    ):
-    super().__init__()
-    d_model_2 = hidden_size*2
-
-    self.d_ff = hidden_size * mlp_ratio
-    self.in_channels = in_channels
-    self.out_channels = in_channels * 2 if learn_sigma else in_channels
-
-    self.diffit_res_block_group_1 = ResBlockGroup(num_heads, dropout, self.d_ff, L1, in_channels=hidden_size, out_channels=hidden_size, img_size=input_size)
-    self.diffit_res_block_group_2 = ResBlockGroup(num_heads, dropout, self.d_ff, L2, in_channels=d_model_2, out_channels=d_model_2, img_size=input_size//2)
-    self.diffit_res_block_group_3 = ResBlockGroup(num_heads, dropout, self.d_ff, L3, in_channels=d_model_2, out_channels=d_model_2, img_size=input_size//4)
-
-    self.downsample_1 = Downsample(in_channels=hidden_size, out_channels=d_model_2)
-    self.downsample_2 = Downsample(in_channels=d_model_2, out_channels=d_model_2)
-
-    self.upsample_1 = Upsample(in_channels=d_model_2, out_channels=d_model_2)
-    self.upsample_2 = Upsample(in_channels=d_model_2, out_channels=hidden_size)
-
-    self.tokenizer = Tokenizer(out_channels=hidden_size, in_channels=self.in_channels)
-    self.head = Head(in_channels=hidden_size, out_channels=self.out_channels)
-
-  def uShape(self, xs, t):
-    output_downsample_1 = self.downsample_1(self.diffit_res_block_group_1(xs, t))
-    output_downsample_2 = self.downsample_2(self.diffit_res_block_group_2(output_downsample_1, t))
-    uLeft = output_downsample_2
-
-    uCenter = self.diffit_res_block_group_3(uLeft, t)
-
-    input_upsample_1 = uCenter + uLeft
-    input_upsample_2 = self.diffit_res_block_group_2(self.upsample_1(input_upsample_1), t) + output_downsample_1
-    uRight = self.diffit_res_block_group_1(self.upsample_2(input_upsample_2), t)
-
-    return uRight
-
-  def forward(self, x, t):
-    decoder_output = self.head(self.uShape(self.tokenizer(x), t))
-    return decoder_output
+    def forward(self, x, t, l, skip_connections):
+        out_1 = self.diffit_res_block_group_3(self.upsample_1(x + skip_connections[2]), t, l)
+        out_2 = self.diffit_res_block_group_2(self.upsample_2(out_1 + skip_connections[1]), t, l)
+        out_3 = self.diffit_res_block_group_1(self.upsample_3(out_2 + skip_connections[0]), t, l)
+        return out_3
 
 
 #################################################################################
-#                                   DiffiT Configs                                  #
+#                               DiffiT Model                                    #
+#################################################################################
+
+
+class LatentDiffiT(nn.Module):
+    """
+    DiffiT for latent image generation.
+
+    Architecture parallels DiT:
+        Patch embedding -> Transformer blocks -> Final layer -> Unpatchify
+
+    Key difference: Uses TMSA (Time-dependent Multihead Self-Attention)
+    instead of standard attention + adaLN-Zero conditioning.
+    """
+    def __init__(
+        self,
+        input_size=32,
+        patch_size=2,
+        in_channels=4,
+        hidden_size=1152,
+        depth=30,
+        num_heads=16,
+        mlp_ratio=4.0,
+        class_dropout_prob=0.1,
+        num_classes=1000,
+        learn_sigma=True,
+
+        act_layer=lambda: nn.GELU(approximate="tanh"),
+        norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6),
+        lin_layer=nn.Linear,
+    ):
+        super().__init__()
+        self.learn_sigma = learn_sigma
+        self.in_channels = in_channels
+        self.out_channels = in_channels * 2 if learn_sigma else in_channels
+        self.patch_size = patch_size
+        self.num_heads = num_heads
+
+        # Embeddings (same infrastructure as DiT)
+        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
+        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        num_patches = self.x_embedder.num_patches
+        # Fixed sin-cos positional embedding
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+
+        # DiffiT transformer blocks (each block has its own weights)
+        seq_len = num_patches
+        self.blocks = nn.ModuleList([
+            DiffiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, seq_len=seq_len,
+                        act_layer=act_layer, norm_layer=norm_layer, lin_layer=lin_layer)
+            for _ in range(depth)
+        ])
+        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        # Initialize transformer layers:
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        # Initialize (and freeze) pos_embed by sin-cos embedding:
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
+        w = self.x_embedder.proj.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        nn.init.constant_(self.x_embedder.proj.bias, 0)
+
+        # Initialize label embedding table:
+        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+
+        # Initialize timestep embedding MLP:
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+
+        # Zero-out TMSA position bias and output projection in each block
+        # so that each block starts as identity (via residual connections),
+        # analogous to DiT's zero-init of adaLN gating:
+        for block in self.blocks:
+            nn.init.constant_(block.tmsa.WK.weight, 0)
+            nn.init.constant_(block.tmsa.wo.weight, 0)
+
+        # Zero-out output layers:
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
+
+    def unpatchify(self, x):
+        """
+        x: (N, T, patch_size**2 * C)
+        imgs: (N, C, H, W)
+        """
+        c = self.out_channels
+        p = self.x_embedder.patch_size[0]
+        h = w = int(x.shape[1] ** 0.5)
+        assert h * w == x.shape[1]
+
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
+        x = torch.einsum('nhwpqc->nchpwq', x)
+        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
+        return imgs
+
+    def ckpt_wrapper(self, module):
+        def ckpt_forward(*inputs):
+            outputs = module(*inputs)
+            return outputs
+        return ckpt_forward
+
+    def forward(self, x, t, y):
+        """
+        Forward pass of DiffiT.
+        x: (N, C, H, W) tensor of spatial inputs (latent representations of images)
+        t: (N,) tensor of diffusion timesteps
+        y: (N,) tensor of class labels
+        """
+        x = self.x_embedder(x) + self.pos_embed   # (N, S, D)
+        t = self.t_embedder(t)                      # (N, D)
+        y = self.y_embedder(y, self.training)       # (N, D)
+        c = t + y                                   # (N, D)
+
+        for i, block in enumerate(self.blocks):
+            x = torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(block), x, c, use_reentrant=True)   # (N, S, D)
+
+        x = self.final_layer(x, c)                  # (N, S, patch_size ** 2 * out_channels)
+        x = self.unpatchify(x)                      # (N, out_channels, H, W)
+        return x
+
+    def forward_with_cfg(self, x, t, y, cfg_scale):
+        """
+        Forward pass of DiffiT, but also batches the unconditional forward pass
+        for classifier-free guidance.
+        """
+        half = x[: len(x) // 2]
+        combined = torch.cat([half, half], dim=0)
+        model_out = self.forward(combined, t, y)
+        # For exact reproducibility reasons, we apply classifier-free guidance on only
+        # three channels by default. The standard approach to cfg applies it to all channels.
+        # This can be done by uncommenting the following line and commenting-out the line following that.
+        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
+        eps, rest = model_out[:, :3], model_out[:, 3:]
+        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+        eps = torch.cat([half_eps, half_eps], dim=0)
+        return torch.cat([eps, rest], dim=1)
+
+class ImageDiffiT(nn.Module):
+    def __init__(
+        self,
+        input_size=32,
+        in_channels=4,
+        hidden_size=1152,
+        num_heads=16,
+        mlp_ratio=4.0,
+        dropout=0.1,
+        num_classes=1000,
+        learn_sigma=True,
+
+        L1: int = 2,
+        L2: int = 2,
+        L3: int = 2,
+        L4: int = 2,
+
+        act_layer=lambda: nn.GELU(approximate="tanh"),
+        norm_layer=lambda hidden_size: nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6),
+    ):
+        super().__init__()
+        self.d_ff = hidden_size * mlp_ratio
+        self.in_channels = in_channels
+        self.out_channels = in_channels * 2 if learn_sigma else in_channels
+
+        self.encoder = DiffiTEncoder(d_model=hidden_size, num_heads=num_heads, dropout=dropout, d_ff=self.d_ff, img_size=input_size, label_size=num_classes, L1=L1, L2=L2, L3=L3, L4=L4, act_layer=act_layer, norm_layer=norm_layer)
+        self.decoder = DiffiTDecoder(d_model=hidden_size, num_heads=num_heads, dropout=dropout, d_ff=self.d_ff, img_size=input_size, label_size=num_classes, L1=L1, L2=L2, L3=L3, L4=L4, act_layer=act_layer, norm_layer=norm_layer)
+        self.bottleneck = ResBlockGroup(L4, hidden_size * 2, hidden_size * 2, num_heads, dropout, self.d_ff, img_size=input_size, label_size=num_classes, act_layer=act_layer, norm_layer=norm_layer)
+
+        self.tokenizer = nn.Conv2d(self.in_channels, hidden_size, kernel_size=3, padding=1)
+        self.head = nn.Sequential(
+            nn.GroupNorm(num_groups=hidden_size//4, num_channels=hidden_size),
+            nn.Conv2d(in_channels=hidden_size, out_channels=self.out_channels, kernel_size=3, padding=1)
+        )
+
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        # Initialize tokenizer and head:
+        nn.init.xavier_uniform_(self.tokenizer.weight)
+        nn.init.constant_(self.tokenizer.bias, 0)
+        nn.init.xavier_uniform_(self.head[1].weight)
+        nn.init.constant_(self.head[1].bias, 0)
+    
+    def forward(self, x, t, y):
+        skip_connections = self.encoder(x, t, y)
+        bottleneck = self.bottleneck(skip_connections[-1], t, y)
+        out = self.decoder(bottleneck, t, y, skip_connections)
+        return self.head(out)
+    
+    def forward_with_cfg(self, x, t, y, cfg_scale):
+        half = x[: len(x) // 2]
+        combined = torch.cat([half, half], dim=0)
+        model_out = self.forward(combined, t, y)
+        eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
+        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+        eps = torch.cat([half_eps, half_eps], dim=0)
+        return torch.cat([eps, rest], dim=1)
+
+
+#################################################################################
+#                                   DiffiT Configs                              #
 #################################################################################
 
 def DiffiT_XL_2(**kwargs):
-    return DiffiT(depth=30, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
+    return LatentDiffiT(depth=30, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
 
 def DiffiT_XL_4(**kwargs):
-    return DiffiT(depth=30, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
+    return LatentDiffiT(depth=30, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
 
 def DiffiT_XL_8(**kwargs):
-    return DiffiT(depth=30, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
+    return LatentDiffiT(depth=30, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
 
 def DiffiT_L_2(**kwargs):
-    return DiffiT(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
+    return LatentDiffiT(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
 
 def DiffiT_L_4(**kwargs):
-    return DiffiT(depth=24, hidden_size=1024, patch_size=4, num_heads=16, **kwargs)
+    return LatentDiffiT(depth=24, hidden_size=1024, patch_size=4, num_heads=16, **kwargs)
 
 def DiffiT_L_8(**kwargs):
-    return DiffiT(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
+    return LatentDiffiT(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
 
 def DiffiT_B_2(**kwargs):
-    return DiffiT(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
+    return LatentDiffiT(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
 
 def DiffiT_B_4(**kwargs):
-    return DiffiT(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
+    return LatentDiffiT(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
 
 def DiffiT_B_8(**kwargs):
-    return DiffiT(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
+    return LatentDiffiT(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
 
 def DiffiT_S_2(**kwargs):
-    return DiffiT(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
+    return LatentDiffiT(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
 
 def DiffiT_S_4(**kwargs):
-    return DiffiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
+    return LatentDiffiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
 
 def DiffiT_S_8(**kwargs):
-    return DiffiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
+    return LatentDiffiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
 
 
 DiffiT_models = {

@@ -1,7 +1,4 @@
-# Modified from OpenAI's diffusion repos
-#     GLIDE: https://github.com/openai/glide-text2im/blob/main/glide_text2im/gaussian_diffusion.py
-#     ADM:   https://github.com/openai/guided-diffusion/blob/main/guided_diffusion
-#     IDDPM: https://github.com/openai/improved-diffusion/blob/main/improved_diffusion/gaussian_diffusion.py
+# Modified from fast-dit's repo: https://github.com/chuanyangjin/fast-DiT/tree/main
 
 import numpy as np
 import torch as th
@@ -99,19 +96,12 @@ class SpacedDiffusion(GaussianDiffusion):
     def condition_mean(self, cond_fn, *args, **kwargs):
         return super().condition_mean(self._wrap_model(cond_fn), *args, **kwargs)
 
-    def condition_score(self, cond_fn, *args, **kwargs):
-        return super().condition_score(self._wrap_model(cond_fn), *args, **kwargs)
-
     def _wrap_model(self, model):
         if isinstance(model, _WrappedModel):
             return model
         return _WrappedModel(
             model, self.timestep_map, self.original_num_steps
         )
-
-    def _scale_timesteps(self, t):
-        # Scaling is done by the wrapped model.
-        return t
 
 
 class _WrappedModel:

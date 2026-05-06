@@ -3,6 +3,13 @@ from typing import Literal, Optional
 import torch
 import torch.nn as nn
 
+from modifiers.utils import review_as_with_batch
+
+
+##########################################################################
+#       Hand-crafted implementations of normalization layers             #
+##########################################################################
+
 
 class LayerNorm(nn.Module):
     """
@@ -40,7 +47,12 @@ class LayerNorm(nn.Module):
             self.register_parameter('weight', None)
             self.register_parameter('bias', None)
 
-    def forward(self, x: torch.Tensor, layer_mean: Optional[torch.Tensor] = None, layer_var: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+            self,
+            x: torch.Tensor,
+            layer_mean: Optional[torch.Tensor] = None,
+            layer_var: Optional[torch.Tensor] = None
+        ) -> torch.Tensor:
         """
         Forward pass for layer normalization.
 
@@ -83,19 +95,31 @@ class LayerNormQuantile(LayerNorm):
             self,
             *args,
             sparsity_level: Optional[float] = None,
-            quantit_search_mode: Literal['global', 'batchwise', 'channelwise'] = 'channelwise',
+            quantile_search_mode: Literal['global', 'batchwise', 'channelwise'] = 'channelwise',
             running_stats: bool = False,
             running_shape: Optional[torch.Size] = None,
             momentum: float = 0.1,
+            max_tracked_cnt: Optional[int] = 50000,
             **kwargs
         ):
+        """
+        Args:
+            *args: Positional arguments for the base LayerNorm class.
+            sparsity_level (Optional[float]): Fraction of elements to consider as non-zero (between
+                0.0 and 1.0). If None, behaves like standard LayerNorm.
+            quantile_search_mode (str): Method to compute quantile threshold. Options are:
+                - 'global': Compute quantile across all elements in the input tensor.
+                - 'batchwise': Compute quantile separately for each sample in the batch.
+                - 'channelwise': Compute quantile separately for each channel (default).
+        """
+
         super().__init__(*args, **kwargs)
 
         assert sparsity_level is None or (0.0 < sparsity_level < 1.0), \
             "sparsity_level must be in the range (0.0, 1.0)"
 
         self.sparsity_level = sparsity_level
-        self.quantit_search_mode = quantit_search_mode
+        self.quantile_search_mode = quantile_search_mode
         self.running_stats = running_stats
         self.momentum = momentum
 
@@ -103,14 +127,13 @@ class LayerNormQuantile(LayerNorm):
             'global': lambda x: x.view(-1),
             'batchwise': lambda x: x.view(x.size(0), -1),
             'channelwise': lambda x: x.view(x.size(0), x.size(1), -1),
-        }[self.quantit_search_mode]
+        }[self.quantile_search_mode]
 
         if self.running_stats:
-            self.register_buffer('running_layer_mean', torch.zeros(running_shape or (1, 256, 3)))
+            self.register_buffer('running_layer_mean', torch.zeros(running_shape or (384)))
             self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
-
-    def _layer_mean_review(self, layer_mean: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
-        return layer_mean.view(1, *layer_mean.shape, *((1,) * (len(target_shape) - len(layer_mean.shape) - 1)))
+            
+        self.max_tracked_cnt = max_tracked_cnt
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -123,30 +146,53 @@ class LayerNormQuantile(LayerNorm):
         """
         layer_mean, layer_var = None, None
 
-        if self.sparsity_level is not None:
-            if self.training or self.running_layer_mean is None:
-                # Compute quantile threshold
-                x_viewed = self.quantile_view_fn(x)
-                layer_mean = torch.quantile(x_viewed, self.sparsity_level, dim=-1)
-                layer_mean = layer_mean.mean(dim=0) # Average over batch
-                layer_mean = self._layer_mean_review(layer_mean, x.shape)
+        if self.sparsity_level is None:
+            return super().forward(x)
 
-                if self.running_stats:
-                    with torch.no_grad():
-                        self.running_layer_mean = (1 - self.momentum) * self.running_layer_mean + self.momentum * layer_mean
-                        self.num_batches_tracked += 1
+        if self.running_stats and self.max_tracked_cnt is not None and self.max_tracked_cnt <= self.num_batches_tracked:
+            if len(self.running_layer_mean.shape) != 1:
+                self.running_layer_mean = self.running_layer_mean.mean(dim=(0,-1))
+            layer_mean = self.running_layer_mean
+        elif self.training or self.running_layer_mean is None:
             # Compute quantile threshold
-            else:
-                running_layer_mean = self.running_layer_mean.mean(dim=-1).squeeze(0)
-                layer_mean = self._layer_mean_review(running_layer_mean, x.shape)
-                
+            x_viewed = self.quantile_view_fn(x)
+            # layer_mean = torch.quantile(x_viewed, self.sparsity_level, dim=-1)
+            n_remove = round(self.sparsity_level * x_viewed.size(dim=-1))
+            layer_mean = torch.kthvalue(x_viewed, n_remove, dim=-1).values
+            layer_mean = layer_mean.mean(dim=0) # Average over batch
+
+            if self.running_stats:
+                with torch.no_grad():
+                    if self.num_batches_tracked != 0:
+                        self.running_layer_mean = (1 - self.momentum) * self.running_layer_mean + self.momentum * layer_mean
+                    else:
+                        self.running_layer_mean = layer_mean
+                    self.num_batches_tracked += 1
+        # Compute quantile threshold
+        else:
+            if len(self.running_layer_mean.shape) != 1:
+                self.running_layer_mean = self.running_layer_mean.mean(dim=(0,-1))
+            layer_mean = self.running_layer_mean
+
+        layer_mean = review_as_with_batch(layer_mean, x.shape)
             
         return super().forward(x, layer_mean=layer_mean, layer_var=layer_var)
     
     def extra_repr(self):
         return f'(mean=quantile, var=standard), quantile={self.sparsity_level}, {super().extra_repr()}'
 
+
+##########################################################################
+#                 List of available normalization layers                 #
+##########################################################################
+
+
 NORMALIZATIONS = {
     'LayerNorm':                 lambda hidden_size: LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6),
-    'LayerNorm-MeanQuantile-50': lambda hidden_size: LayerNormQuantile(hidden_size, sparsity_level=0.5, running_stats=True, elementwise_affine=False, eps=1e-6),
+
+    'LayerNorm-MeanQuantile-10': lambda hidden_size: LayerNormQuantile(hidden_size, sparsity_level=0.1, elementwise_affine=False, eps=1e-6),
+    'LayerNorm-MeanQuantile-25': lambda hidden_size: LayerNormQuantile(hidden_size, sparsity_level=0.25, elementwise_affine=False, eps=1e-6),
+    'LayerNorm-MeanQuantile-50': lambda hidden_size: LayerNormQuantile(hidden_size, sparsity_level=0.5, elementwise_affine=False, eps=1e-6),
+    'LayerNorm-MeanQuantile-75': lambda hidden_size: LayerNormQuantile(hidden_size, sparsity_level=0.75, elementwise_affine=False, eps=1e-6),
+    'LayerNorm-MeanQuantile-90': lambda hidden_size: LayerNormQuantile(hidden_size, sparsity_level=0.9, elementwise_affine=False, eps=1e-6),
 }

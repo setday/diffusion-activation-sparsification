@@ -1,99 +1,30 @@
-# Modified from Meta's DiT repo: https://github.com/facebookresearch/DiT/tree/main
+# Modified from fast-dit's repo: https://github.com/chuanyangjin/fast-DiT/tree/main
 
 """
 A minimal training script for DiT.
 """
-import torch
-# the first flag below was False when we tested this script but True makes A100 training a lot faster:
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cudnn.benchmark = True  # Optimize for consistent input sizes
-from torch.utils.data import Dataset, DataLoader
-import numpy as np
-from collections import OrderedDict
 from copy import deepcopy
 from time import time
-import argparse
-import logging
 import os
+
+import torch
+from torch.utils.data import DataLoader
+
 from accelerate import Accelerator
 
-from models.dit import DiT_models
-from models.diffit import DiffiT_models
-from moddifiers.activation import ACTIVATIONS
-from moddifiers.normalization import NORMALIZATIONS
 from diffusion import create_diffusion
 
+from utils.train_utils import find_model, update_ema, create_logger
+from utils.dataset_utils import FeatureDataset as CustomDataset
+from utils.common import setup_env, parse_common_args, create_model
 
-#################################################################################
-#                             Training Helper Functions                         #
-#################################################################################
 
-@torch.no_grad()
-def update_ema(ema_model, model, decay=0.9999):
+setup_env()
+
+
+def main(args):
     """
-    Step the EMA model towards the current model.
-    """
-    ema_params = OrderedDict(ema_model.named_parameters())
-    model_params = OrderedDict(model.named_parameters())
-
-    for name, param in model_params.items():
-        name = name.replace("module.", "")
-        # TODO: Consider applying only to params that require_grad to avoid small numerical changes of pos_embed
-        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
-
-
-def requires_grad(model, flag=True):
-    """
-    Set requires_grad flag for all parameters in a model.
-    """
-    for p in model.parameters():
-        p.requires_grad = flag
-
-
-def create_logger(logging_dir):
-    """
-    Create a logger that writes to a log file and stdout.
-    """
-    logging.basicConfig(
-        level=logging.INFO,
-        format='[\033[34m%(asctime)s\033[0m] %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S',
-        handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
-    )
-    logger = logging.getLogger(__name__)
-    return logger
-
-
-class CustomDataset(Dataset):
-    def __init__(self, features_dir):
-        self.features_dir = features_dir
-
-        self.features_files = np.load(os.path.join(self.features_dir, "imagenet256_features_all.npy"))
-        self.labels_files = np.load(os.path.join(self.features_dir, "imagenet256_labels_all.npy"))
-
-    def __len__(self):
-        assert len(self.features_files) == len(self.labels_files), \
-            "Number of feature files and label files should be same"
-        return len(self.features_files)
-
-    def __getitem__(self, idx):
-        feature_file = self.features_files[idx]
-        label_file = self.labels_files[idx]
-        
-        features = feature_file
-        labels = label_file
-        
-        return torch.from_numpy(features), torch.from_numpy(labels)
-
-
-#################################################################################
-#                                  Training Loop                                #
-#################################################################################
-
-def main(args, act_layer, norm_layer):
-    """
-    Trains a new DiT model.
+    Trains a new DiT model or ControlNet adapter.
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
@@ -105,45 +36,97 @@ def main(args, act_layer, norm_layer):
     if accelerator.is_main_process:
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
         model_string_name = args.model.replace("/", "-")  # e.g., DiT-XL/2 --> DiT-XL-2 (for naming folders)
-        experiment_dir = f"{args.results_dir}/{model_string_name}-{act_layer}-{norm_layer}"  # Create an experiment folder
+        suffix = "-controlnet" if args.train_controlnet else ""
+        experiment_dir = f"{args.results_dir}/{model_string_name}-{args.act_layer}-{args.norm_layer}-{args.attn_layer}-{args.mlp_layer}{suffix}"  # Create an experiment folder
         checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
         os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
 
     # Create model:
-    assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
-    latent_size = args.image_size // 8
-    if args.model in DiT_models:
-        model = DiT_models[args.model](
-            input_size=latent_size,
-            num_classes=args.num_classes,
-            act_layer=ACTIVATIONS[act_layer],
-            norm_layer=NORMALIZATIONS[norm_layer],
-        )
-    elif args.model in DiffiT_models:
-        model = DiffiT_models[args.model](
-            input_size=latent_size,
-            num_classes=args.num_classes,
-            act_layer=ACTIVATIONS[act_layer],
-            norm_layer=NORMALIZATIONS[norm_layer],
-        )
-    else:
-        raise ValueError(f"Model {args.model} not found in DiT_models or DiffiT_models.")
+    model = create_model(args)
+
+    is_finetune = args.ckpt is not None
+    if is_finetune:
+        state_dict = find_model(args.ckpt)
+        model.load_state_dict(state_dict)
+
     # Note that parameter initialization is done within the DiT constructor
     model = model.to(device)
+
+    # Handle ControlNet training
+    if args.train_controlnet:
+        from models.controlnet import ControlNetAdapter, ControlNetTrainer
+
+        model = ControlNetAdapter(
+            base_model=model,
+            num_classes=args.num_classes,
+            hidden_size=model.hidden_size if hasattr(model, 'hidden_size') else 384,
+            control_depth=args.controlnet_depth,
+        )
+        model = model.to(device)
+
+        # Freeze base model, only train ControlNet
+        ControlNetTrainer.freeze_base_model(model)
+
+        if args.controlnet_ckpt is not None:
+            ckpt = torch.load(args.controlnet_ckpt, map_location=device)
+            model.control_net.load_state_dict(ckpt)
+
+        if accelerator.is_main_process:
+            logger.info("ControlNet training mode enabled. Base model frozen.")
+
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
-    requires_grad(ema, False)
+
+    # ----------------------------------------------------
+    # FREEZE BASE MODEL, UNFREEZE ADAPTERS IF REQUESTED
+    # ----------------------------------------------------
+    trainable_params = model.parameters()
+    if args.train_adapters_only:
+        for p in model.parameters():
+            p.requires_grad = False
+
+        trainable_params_list = []
+        for name, module in model.named_modules():
+            # Check strictly for `.router` attribute, skipping attention projections or base MLPs
+            if hasattr(module, 'router_loss') and hasattr(module, 'router'):
+                for p in module.router.parameters():
+                    p.requires_grad = True
+                    trainable_params_list.append(p)
+
+        trainable_params = trainable_params_list
+
+        if accelerator.is_main_process:
+            num_trainable = sum(p.numel() for p in trainable_params)
+            num_total = sum(p.numel() for p in model.parameters())
+            logger.info(f"Adapter Training Mode On! Total Parameters: {num_total:,} | Trainable Parameters: {num_trainable:,}")
+
+        if len(trainable_params) == 0 and accelerator.is_main_process:
+            logger.warning("No trainable parameters found! Did you pass appropriate Polar modifiers?")
+
+    for p in ema.parameters():
+        p.requires_grad = False
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
     if accelerator.is_main_process:
-        logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
+        logger.info(f"{args.model} Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    if args.train_controlnet:
+        from models.controlnet import ControlNetTrainer
+        opt = ControlNetTrainer.create_optimizer(model, lr=1e-4)
+        if accelerator.is_main_process:
+            logger.info("ControlNet optimizer created for trainable parameters only")
+    else:
+        lr = 1e-4 if args.model.startswith('DiT') else 3e-4
+        weight_decay = 0.0 if args.train_adapters_only else (0.0 if args.model.startswith('DiT') else 0.9999)
+        if is_finetune:
+            lr /= 10  # Use a smaller learning rate for finetuning
+        if accelerator.is_main_process:
+            logger.info(f"{lr=} {weight_decay=}")
+        opt = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
 
     # Setup data:
-    features_dir = args.feature_path
-    dataset = CustomDataset(features_dir)
+    dataset = CustomDataset(args.feature_path)
     loader = DataLoader(
         dataset,
         batch_size=int(args.global_batch_size // accelerator.num_processes),
@@ -166,7 +149,22 @@ def main(args, act_layer, norm_layer):
     log_steps = 0
     running_loss = 0
     start_time = time()
-    
+
+    # =======================================================
+
+    if accelerator.is_main_process:
+        checkpoint = {
+            "model": model.state_dict(),
+            "ema": ema.state_dict(),
+            "opt": opt.state_dict(),
+            "args": args
+        }
+        checkpoint_path = f"{checkpoint_dir}/{0:07d}.pt"
+        torch.save(checkpoint, checkpoint_path)
+        logger.info(f"Saved checkpoint to {checkpoint_path}")
+
+    # =======================================================
+
     if accelerator.is_main_process:
         logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(args.epochs):
@@ -179,8 +177,25 @@ def main(args, act_layer, norm_layer):
             y = y.squeeze(dim=1)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(y=y)
-            loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
-            loss = loss_dict["loss"].mean()
+
+            if args.train_adapters_only:
+                # Only train the adapters (routers). Do a forward pass to collect router self-loss.
+                _ = diffusion.training_losses(model, x, t, model_kwargs)
+
+                total_router_loss = 0.0
+                num_routers = 0
+                for module in model.modules():
+                    if hasattr(module, 'module'): # unwraps DDP
+                        module = module.module
+                    if hasattr(module, 'router_loss'):
+                        total_router_loss += module.router_loss
+                        num_routers += 1
+
+                loss = total_router_loss / max(1, num_routers)
+            else:
+                loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+                loss = loss_dict["loss"].mean()
+
             opt.zero_grad()
             accelerator.backward(loss)
             opt.step()
@@ -211,40 +226,55 @@ def main(args, act_layer, norm_layer):
             # Save DiT checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if accelerator.is_main_process:
-                    checkpoint = {
-                        "model": model.state_dict(),
-                        "ema": ema.state_dict(),
-                        "opt": opt.state_dict(),
-                        "args": args
-                    }
+                    if args.train_adapters_only:
+                        unwrapped_model = accelerator.unwrap_model(model)
+                        adapter_state_dict = {
+                            k: v for k, v in unwrapped_model.state_dict().items() if "router" in k
+                        }
+                        checkpoint = {
+                            "adapter_model": adapter_state_dict,
+                            "opt": opt.state_dict(),
+                            "args": args
+                        }
+                    elif args.train_controlnet:
+                        unwrapped_model = accelerator.unwrap_model(model)
+                        controlnet_state = unwrapped_model.control_net.state_dict()
+                        injection_state = {
+                            k: v for k, v in unwrapped_model.state_dict().items() if "injection" in k
+                        }
+                        checkpoint = {
+                            "control_net": controlnet_state,
+                            "injections": injection_state,
+                            "opt": opt.state_dict(),
+                            "args": args
+                        }
+                    else:
+                        checkpoint = {
+                            "model": model.state_dict(),
+                            "ema": ema.state_dict(),
+                            "opt": opt.state_dict(),
+                            "args": args
+                        }
+
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
 
-    model.eval()  # important! This disables randomized embedding dropout
-    # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
-    
     if accelerator.is_main_process:
         logger.info("Done!")
 
 
 if __name__ == "__main__":
-    # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
-    parser = argparse.ArgumentParser()
+    parser = parse_common_args(add_model_args=True, add_training_args=True)
     parser.add_argument("--feature-path", type=str, default="features")
     parser.add_argument("--results-dir", type=str, default="results")
-    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()) + list(DiT_models.keys()), default="DiT-XL/2")
-    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
-    parser.add_argument("--num-classes", type=int, default=1000)
-    parser.add_argument("--epochs", type=int, default=1400)
-    parser.add_argument("--global-batch-size", type=int, default=256)
-    parser.add_argument("--global-seed", type=int, default=0)
-    parser.add_argument("--num-workers", type=int, default=256)
+    parser.add_argument("--epochs", type=int, default=1400) # For ft use 20 epochs.
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
-    
-    parser.add_argument("--act-layer", type=str, choices=["GeLU", "ReLU"], default="GeLU")
-    parser.add_argument("--norm-layer", type=str, choices=["LayerNorm", "LayerNorm-MeanQuantile-50"], default="LayerNorm")
-    
+    parser.add_argument("--ckpt", type=str, default=None, help="Optional path to a DiT checkpoint for finetuning")
+    parser.add_argument("--train-controlnet", action="store_true", help="Train a ControlNet adapter for class conditioning")
+    parser.add_argument("--controlnet-ckpt", type=str, default=None, help="Path to pre-trained ControlNet checkpoint")
+    parser.add_argument("--controlnet-depth", type=int, default=6, help="Depth of ControlNet")
+
     args = parser.parse_args()
-    main(args, args.act_layer, args.norm_layer)
+    main(args)

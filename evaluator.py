@@ -1,4 +1,4 @@
-# Modified from OpenAI's diffusion repo: https://github.com/openai/guided-diffusion/tree/main
+# Modified from fast-dit's repo: https://github.com/openai/guided-diffusion/tree/main/evaluations
 
 import argparse
 import io

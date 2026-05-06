@@ -1,78 +1,32 @@
-# Modified from Meta's DiT repo: https://github.com/facebookresearch/DiT/tree/main
+# Modified from fast-dit's repo: https://github.com/chuanyangjin/fast-DiT/tree/main
 
-"""
-A minimal training script for DiT using PyTorch DDP.
-"""
+import os
+
+from tqdm import tqdm
+
+import numpy as np
+
 import torch
-# the first flag below was False when we tested this script but True makes A100 training a lot faster:
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
 import torch.distributed as dist
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
-import numpy as np
-from PIL import Image
-import argparse
-import os
-from tqdm import tqdm
-from datasets import load_dataset
 
+from datasets import load_dataset
 from diffusers.models import AutoencoderKL
 
-
-#################################################################################
-#                             Training Helper Functions                         #
-#################################################################################
-
-def cleanup():
-    """
-    End DDP training.
-    """
-    dist.destroy_process_group()
+from utils.common import setup_env, parse_common_args
+from utils.dataset_utils import center_crop_arr, CustomDataset
 
 
-def center_crop_arr(pil_image, image_size):
-    """
-    Center cropping implementation from ADM.
-    https://github.com/openai/guided-diffusion/blob/8fb3ad9197f16bbc40620447b2742e13458d2831/guided_diffusion/image_datasets.py#L126
-    """
-    while min(*pil_image.size) >= 2 * image_size:
-        pil_image = pil_image.resize(
-            tuple(x // 2 for x in pil_image.size), resample=Image.BOX
-        )
+setup_env()
 
-    scale = image_size / min(*pil_image.size)
-    pil_image = pil_image.resize(
-        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
-    )
-
-    arr = np.array(pil_image)
-    crop_y = (arr.shape[0] - image_size) // 2
-    crop_x = (arr.shape[1] - image_size) // 2
-    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
-
-
-class CustomDataset(Dataset):
-    def __init__(self, ds, t):
-        self.ds = ds
-        self.t = t
-
-    def __len__(self):
-        return len(self.ds)
-
-    def __getitem__(self, idx):
-        return self.t(self.ds[idx]["jpg"].convert("RGB")), self.ds[idx]["cls"]
-
-
-#################################################################################
-#                                  Training Loop                                #
-#################################################################################
 
 def main(args):
     """
-    Trains a new DiT model.
-    """    
+    Extract features from a pre-trained VAE for the entire ImageNet-1K training set using DDP, and save them to .npy files.
+    """
+    
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
     # Setup DDP:
@@ -104,8 +58,9 @@ def main(args):
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
     dataset = CustomDataset(load_dataset(
-        "timm/imagenet-1k-wds",
+        "timm/imagenet-1k-wds", # "pcuenq/lsun-bedrooms"
         split="train",
+        trust_remote_code=True,
         num_proc=16,
     ), transform)
     sampler = DistributedSampler(
@@ -138,16 +93,11 @@ def main(args):
     np.save(f'{args.features_path}/imagenet256_features_all.npy', torch.vstack(xs).numpy())
     np.save(f'{args.features_path}/imagenet256_labels_all.npy', torch.vstack(ys).numpy())
     
-    cleanup()
+    dist.destroy_process_group()
 
 if __name__ == "__main__":
     # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
-    parser = argparse.ArgumentParser()
+    parser = parse_common_args(add_vae_args=True, add_training_args=True)
     parser.add_argument("--features-path", type=str, default="features")
-    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
-    parser.add_argument("--global-batch-size", type=int, default=256)
-    parser.add_argument("--global-seed", type=int, default=0)
-    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")
-    parser.add_argument("--num-workers", type=int, default=4)
     args = parser.parse_args()
     main(args)
